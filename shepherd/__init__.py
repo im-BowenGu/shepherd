@@ -6,7 +6,7 @@ import errno
 import os
 from pathlib import Path
 
-from flask import Flask, render_template, send_file, request
+from flask import Flask, render_template, send_file, request, redirect, url_for
 from flask_sockets import Sockets
 from flask_cors import CORS
 import RPi.GPIO as GPIO
@@ -116,7 +116,8 @@ sockets.register_blueprint(pyls.blueprint)
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return redirect("/editor")
+    # return render_template("index.html")
 
 
 @app.route("/about")
