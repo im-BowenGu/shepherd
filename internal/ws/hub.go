@@ -7,7 +7,7 @@ import (
 )
 
 type Hub struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	clients map[*websocket.Conn]bool
 }
 
@@ -30,8 +30,8 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 }
 
 func (h *Hub) Broadcast(message []byte) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	for conn := range h.clients {
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {

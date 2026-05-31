@@ -12,17 +12,19 @@ import (
 	"strings"
 )
 
+const maxExtractionSize = 256 << 20
+
 type UploadHandler struct {
-	userCodePath      string
+	userCodePath       string
 	userCodeEntrypoint string
-	onUpload          func()
+	onUpload           func()
 }
 
 func NewHandler(userCodePath, entrypoint string, onUpload func()) *UploadHandler {
 	return &UploadHandler{
-		userCodePath:      userCodePath,
+		userCodePath:       userCodePath,
 		userCodeEntrypoint: entrypoint,
-		onUpload:          onUpload,
+		onUpload:           onUpload,
 	}
 }
 
@@ -34,7 +36,7 @@ func (h *UploadHandler) ProcessUpload(file multipart.File, header *multipart.Fil
 	}
 
 	if strings.HasSuffix(filename, ".zip") {
-		return h.processZipFile(file)
+		return h.processZipFile(file, header.Size)
 	}
 
 	return fmt.Errorf("unsupported file type: %s", filename)
@@ -52,9 +54,9 @@ func (h *UploadHandler) processPythonFile(file multipart.File) error {
 		os.RemoveAll(tempDir)
 		return fmt.Errorf("create temp file: %w", err)
 	}
-	defer out.Close()
 
 	if _, err := io.Copy(out, file); err != nil {
+		out.Close()
 		os.RemoveAll(tempDir)
 		return fmt.Errorf("copy file: %w", err)
 	}
@@ -63,45 +65,68 @@ func (h *UploadHandler) processPythonFile(file multipart.File) error {
 	return h.swapCodeDir(tempDir)
 }
 
-func (h *UploadHandler) processZipFile(file multipart.File) error {
+func (h *UploadHandler) processZipFile(file multipart.File, size int64) error {
+	if size > maxExtractionSize {
+		return fmt.Errorf("zip file too large (max %d bytes)", maxExtractionSize)
+	}
+
 	tempDir, err := os.MkdirTemp("", "shepherd-user-code-")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 
-	data, err := io.ReadAll(file)
+	z, err := zip.NewReader(file, size)
 	if err != nil {
 		os.RemoveAll(tempDir)
 		return fmt.Errorf("read zip: %w", err)
 	}
 
-	z, err := zip.NewReader(strings.NewReader(string(data)), int64(len(data)))
-	if err != nil {
-		os.RemoveAll(tempDir)
-		return fmt.Errorf("invalid zip: %w", err)
-	}
-
+	var extracted int64
 	for _, f := range z.File {
+		dst := filepath.Join(tempDir, f.Name)
+
+		if !strings.HasPrefix(filepath.Clean(dst), filepath.Clean(tempDir)+string(os.PathSeparator)) {
+			os.RemoveAll(tempDir)
+			return fmt.Errorf("zip entry %s escapes extraction directory", f.Name)
+		}
+
 		if f.FileInfo().IsDir() {
-			os.MkdirAll(filepath.Join(tempDir, f.Name), 0755)
+			os.MkdirAll(dst, 0755)
 			continue
 		}
-		dst := filepath.Join(tempDir, f.Name)
-		os.MkdirAll(filepath.Dir(dst), 0755)
+
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			os.RemoveAll(tempDir)
+			return fmt.Errorf("create dir for %s: %w", f.Name, err)
+		}
+
 		rc, err := f.Open()
 		if err != nil {
 			os.RemoveAll(tempDir)
-			return fmt.Errorf("extract zip entry %s: %w", f.Name, err)
+			return fmt.Errorf("open zip entry %s: %w", f.Name, err)
 		}
+
 		out, err := os.Create(dst)
 		if err != nil {
 			rc.Close()
 			os.RemoveAll(tempDir)
 			return fmt.Errorf("create %s: %w", dst, err)
 		}
-		io.Copy(out, rc)
+
+		written, err := io.CopyN(out, rc, int64(f.UncompressedSize64))
+		extracted += written
 		out.Close()
 		rc.Close()
+
+		if extracted > maxExtractionSize {
+			os.RemoveAll(tempDir)
+			return fmt.Errorf("extracted zip exceeds maximum size")
+		}
+
+		if err != nil {
+			os.RemoveAll(tempDir)
+			return fmt.Errorf("extract %s: %w", f.Name, err)
+		}
 	}
 
 	entrypoint := filepath.Join(tempDir, h.userCodeEntrypoint)

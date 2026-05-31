@@ -56,10 +56,10 @@ func (h *Handler) ListFiles() (*ProjectList, error) {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasSuffix(name, ".py") && !strings.HasSuffix(name, ".xml") && name != "blocks.json" {
+		if name == "main.py" || name == "blocks.json" {
 			continue
 		}
-		if name == "main.py" {
+		if !isProjectFile(name) {
 			continue
 		}
 
@@ -90,9 +90,14 @@ func (h *Handler) ListFiles() (*ProjectList, error) {
 	return result, nil
 }
 
+func isProjectFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".py" || ext == ".xml"
+}
+
 func (h *Handler) ReadFile(filename string) (string, error) {
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
-		return "", fmt.Errorf("invalid filename")
+	if err := validateFilename(filename); err != nil {
+		return "", err
 	}
 
 	data, err := os.ReadFile(filepath.Join(h.robotsrcPath, filename))
@@ -103,11 +108,8 @@ func (h *Handler) ReadFile(filename string) (string, error) {
 }
 
 func (h *Handler) WriteFile(filename string, content string) error {
-	if strings.Count(filename, ".") != 1 {
-		return fmt.Errorf("invalid filename")
-	}
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
-		return fmt.Errorf("invalid filename")
+	if err := validateFilename(filename); err != nil {
+		return err
 	}
 
 	return os.WriteFile(filepath.Join(h.robotsrcPath, filename), []byte(content), 0644)
@@ -117,12 +119,19 @@ func (h *Handler) DeleteFile(filename string) error {
 	if filename == "blocks.json" {
 		return nil
 	}
-	if strings.Count(filename, ".") != 1 {
-		return fmt.Errorf("invalid filename")
-	}
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
-		return fmt.Errorf("invalid filename")
+	if err := validateFilename(filename); err != nil {
+		return err
 	}
 
 	return os.Remove(filepath.Join(h.robotsrcPath, filename))
+}
+
+func validateFilename(name string) error {
+	if name == "" || name[0] == '.' {
+		return fmt.Errorf("invalid filename")
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
+		return fmt.Errorf("invalid filename")
+	}
+	return nil
 }

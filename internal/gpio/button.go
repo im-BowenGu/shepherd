@@ -36,22 +36,20 @@ func (b *Button) poll() {
 
 	if _, err := os.Stat(gpioDir); os.IsNotExist(err) {
 		if err := os.WriteFile(filepath.Join(gpioBase, "export"), []byte(strconv.Itoa(b.pin)), 0644); err != nil {
-			log.Printf("GPIO export failed (will retry): %v", err)
+			log.Printf("GPIO export failed: %v", err)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	directionFile := filepath.Join(gpioDir, "direction")
-	if err := os.WriteFile(directionFile, []byte("in"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(gpioDir, "direction"), []byte("in"), 0644); err != nil {
 		log.Printf("GPIO direction set failed: %v", err)
 		return
 	}
 
 	valueFile := filepath.Join(gpioDir, "value")
-	edgeFile := filepath.Join(gpioDir, "edge")
-	os.WriteFile(edgeFile, []byte("falling"), 0644)
+	os.WriteFile(filepath.Join(gpioDir, "edge"), []byte("falling"), 0644)
 
-	log.Printf("GPIO start button on pin %d (sysfs polling)", b.pin)
+	log.Printf("GPIO start button on pin %d (sysfs polling, falling edge)", b.pin)
 
 	var lastState string
 	for {
@@ -61,15 +59,18 @@ func (b *Button) poll() {
 			continue
 		}
 		current := string(data)
-		if lastState == "0\n" && current == "1\n" {
+		// Button is pulled up (1), pressed = GND (0), released = pulled up (1)
+		if lastState == "1\n" && current == "0\n" {
 			zone := b.detectZone()
 			log.Printf("Start button pressed, zone=%s", zone)
 			if b.onStart != nil {
 				b.onStart(zone)
 			}
+			// Debounce: wait for button release
+			time.Sleep(200 * time.Millisecond)
 		}
 		lastState = current
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

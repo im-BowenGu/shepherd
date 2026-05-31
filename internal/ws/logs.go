@@ -3,14 +3,16 @@ package ws
 import (
 	"log"
 	"os"
+	"sync"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 type LogStreamer struct {
-	hub      *Hub
-	logPath  string
-	oldLogs  string
+	hub     *Hub
+	logPath string
+	mu      sync.Mutex
+	oldLogs string
 }
 
 func NewLogStreamer(hub *Hub, logPath string) *LogStreamer {
@@ -33,7 +35,9 @@ func (l *LogStreamer) Start() error {
 
 	initial, err := os.ReadFile(l.logPath)
 	if err == nil {
+		l.mu.Lock()
 		l.oldLogs = string(initial)
+		l.mu.Unlock()
 	}
 
 	go func() {
@@ -63,16 +67,20 @@ func (l *LogStreamer) Start() error {
 func (l *LogStreamer) processAndBroadcast() {
 	data, err := os.ReadFile(l.logPath)
 	if err != nil {
+		log.Printf("logs: read file: %v", err)
 		return
 	}
 
+	l.mu.Lock()
+	oldLogs := l.oldLogs
 	newLogs := string(data)
-	idx := len(newLogs) - len(l.oldLogs)
+	idx := len(newLogs) - len(oldLogs)
 	if idx < 0 {
 		idx = 0
 	}
 	diff := newLogs[idx:]
 	l.oldLogs = newLogs
+	l.mu.Unlock()
 
 	if diff != "" {
 		l.hub.Broadcast([]byte("[LOGS]" + diff))

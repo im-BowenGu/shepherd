@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -352,8 +353,26 @@ func (s *Server) handleWSPyls(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+
 	if path == "/" {
 		path = "/editor/index.html"
+	}
+
+	// Check if path without trailing slash is a directory
+	checkPath := strings.TrimSuffix(path, "/")
+	if s.staticFS != nil {
+		if f, err := s.staticFS.Open(strings.TrimPrefix(checkPath, "/")); err == nil {
+			if stat, err := f.Stat(); err == nil && stat.IsDir() {
+				f.Close()
+				if !strings.HasSuffix(path, "/") {
+					http.Redirect(w, r, path+"/", http.StatusMovedPermanently)
+					return
+				}
+				path = path + "index.html"
+			} else {
+				f.Close()
+			}
+		}
 	}
 
 	path = strings.TrimPrefix(path, "/")
@@ -364,7 +383,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeContent(w, r, path, time.Time{}, strings.NewReader(string(data)))
+		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(data))
 		return
 	}
 

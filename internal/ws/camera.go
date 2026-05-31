@@ -19,7 +19,6 @@ type CameraStreamer struct {
 	outWidth   float64
 	outHeight  float64
 	mu         sync.Mutex
-	lastMod    int64
 	currentB64 string
 }
 
@@ -71,11 +70,16 @@ func (c *CameraStreamer) Start() error {
 func (c *CameraStreamer) processAndBroadcast() {
 	img, err := c.readImage()
 	if err != nil {
+		log.Printf("camera: read image: %v", err)
 		return
 	}
 
 	img = shrinkImage(img, c.outWidth, c.outHeight)
 	b64 := imageToBase64(img)
+	if b64 == "" {
+		log.Printf("camera: encode image to base64 failed")
+		return
+	}
 
 	c.mu.Lock()
 	c.currentB64 = b64

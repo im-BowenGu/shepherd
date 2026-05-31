@@ -2,7 +2,9 @@ package ws
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"os/exec"
 
@@ -39,24 +41,36 @@ func (p *PylsProxy) Handle(conn *websocket.Conn) {
 		return
 	}
 
-	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	go func() {
-		defer close(done)
+		defer stdout.Close()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			msg := scanner.Bytes()
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			cp := make([]byte, len(msg))
+			copy(cp, msg)
+			if err := conn.WriteMessage(websocket.TextMessage, cp); err != nil {
+				cancel()
 				return
 			}
 		}
+		cancel()
 	}()
 
 	go func() {
+		defer stdin.Close()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				cmd.Process.Kill()
+				cancel()
 				return
 			}
 			var parsed any
@@ -67,6 +81,7 @@ func (p *PylsProxy) Handle(conn *websocket.Conn) {
 		}
 	}()
 
-	<-done
+	<-ctx.Done()
+	io.Copy(io.Discard, stdout)
 	cmd.Wait()
 }

@@ -1,7 +1,6 @@
 package run
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,10 +20,11 @@ type Manager struct {
 	zone   string
 	mode   Mode
 	cmd    *exec.Cmd
-	cancel context.CancelFunc
+	cmdWait chan error
 
 	reaperTimer *time.Timer
 	reapTime    time.Time
+	fifoDir     string
 	fifoPath    string
 	outputFile  *os.File
 }
@@ -56,23 +56,37 @@ func (m *Manager) createFIFO() error {
 	if err != nil {
 		return err
 	}
+	m.fifoDir = dir
 	m.fifoPath = filepath.Join(dir, "start.fifo")
 	return syscall.Mkfifo(m.fifoPath, 0666)
 }
 
 func (m *Manager) StartUserCode() error {
+	m.mu.Lock()
+	if m.state == StateRunning {
+		m.mu.Unlock()
+		return fmt.Errorf("code is already running")
+	}
+	if m.cmdWait != nil {
+		select {
+		case <-m.cmdWait:
+		default:
+		}
+	}
+	m.mu.Unlock()
+
 	entrypoint := filepath.Join(m.cfg.UserCodePath, m.cfg.UserCodeEntrypoint)
+
+	if err := os.MkdirAll(filepath.Dir(m.cfg.OutputFilePath), 0755); err != nil {
+		return fmt.Errorf("create output dir: %w", err)
+	}
 
 	f, err := os.Create(m.cfg.OutputFilePath)
 	if err != nil {
 		return fmt.Errorf("create output file: %w", err)
 	}
-	m.outputFile = f
 
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel = cancel
-
-	cmd := exec.CommandContext(ctx, "python3", "-u", entrypoint, "--startfifo", m.fifoPath)
+	cmd := exec.Command("python3", "-u", entrypoint, "--startfifo", m.fifoPath)
 	cmd.Dir = m.cfg.UserCodePath
 	cmd.Stdout = f
 	cmd.Stderr = f
@@ -81,27 +95,35 @@ func (m *Manager) StartUserCode() error {
 	)
 
 	if err := cmd.Start(); err != nil {
-		cancel()
+		f.Close()
 		return fmt.Errorf("start user code: %w", err)
 	}
-	m.cmd = cmd
 
-	go m.waitForExit()
+	cmdWait := make(chan error, 1)
+	go m.waitForExit(cmd, cmdWait)
+
+	m.mu.Lock()
+	m.cmd = cmd
+	m.cmdWait = cmdWait
+	m.outputFile = f
+	m.state = StateReady
+	m.mu.Unlock()
+
 	return nil
 }
 
-func (m *Manager) waitForExit() {
-	err := m.cmd.Wait()
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Manager) waitForExit(cmd *exec.Cmd, cmdWait chan<- error) {
+	err := cmd.Wait()
+	cmdWait <- err
 
+	m.mu.Lock()
 	if err != nil {
 		log.Printf("user code exited: %v", err)
 	}
-
 	if m.state == StateRunning {
 		m.state = StatePostRun
 	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) SendStartSignal(zone string, mode Mode) error {
@@ -147,41 +169,42 @@ func (m *Manager) StopReaper() {
 
 func (m *Manager) Reap(reason string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	log.Printf("Reaping user code (%s)", reason)
 	if m.state != StateRunning {
 		log.Printf("Warning: state is %s, not running", m.state)
+		m.mu.Unlock()
 		return
 	}
-
 	if m.cmd == nil || m.cmd.Process == nil {
+		m.mu.Unlock()
 		return
 	}
+	cmdWait := m.cmdWait
+	m.mu.Unlock()
 
-	m.cmd.Process.Signal(syscall.SIGTERM)
-
-	done := make(chan struct{})
-	go func() {
-		m.cmd.Wait()
-		close(done)
-	}()
+	if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		log.Printf("SIGTERM failed: %v", err)
+	}
 
 	select {
-	case <-done:
+	case <-cmdWait:
 	case <-time.After(m.cfg.ReapGracePeriod):
 		log.Println("Butchering user code")
-		m.cmd.Process.Signal(syscall.SIGKILL)
-		<-done
+		if err := m.cmd.Process.Signal(syscall.SIGKILL); err != nil {
+			log.Printf("SIGKILL failed: %v", err)
+		}
+		<-cmdWait
 	}
 
+	m.mu.Lock()
 	if m.outputFile != nil {
 		m.outputFile.WriteString("\n==== END OF ROUND ====\n\n")
 		m.outputFile.Close()
 		m.outputFile = nil
 	}
-
 	m.state = StatePostRun
+	m.mu.Unlock()
+
 	log.Println("Done reaping user code")
 }
 
@@ -195,10 +218,20 @@ func (m *Manager) Reset() {
 	m.state = StateReady
 	m.zone = ""
 	m.mode = ""
-	if m.cancel != nil {
-		m.cancel()
+
+	if m.outputFile != nil {
+		m.outputFile.Close()
+		m.outputFile = nil
+	}
+
+	if m.fifoDir != "" {
+		os.RemoveAll(m.fifoDir)
+		m.fifoDir = ""
+		m.fifoPath = ""
 	}
 	m.mu.Unlock()
+
+	m.createFIFO()
 
 	cmd := exec.Command("python3", "-c", "import robot.reset; robot.reset.reset()")
 	cmd.Env = append(os.Environ(), "PYTHONPATH="+m.cfg.RobotLibPath)
@@ -253,8 +286,16 @@ func (m *Manager) Cleanup() {
 	if m.cmd != nil && m.cmd.Process != nil {
 		m.cmd.Process.Kill()
 	}
+	if m.cmdWait != nil {
+		select {
+		case <-m.cmdWait:
+		default:
+		}
+	}
 	if m.outputFile != nil {
 		m.outputFile.Close()
 	}
-	os.RemoveAll(filepath.Dir(m.fifoPath))
+	if m.fifoDir != "" {
+		os.RemoveAll(m.fifoDir)
+	}
 }
