@@ -20,6 +20,8 @@ type CameraStreamer struct {
 	outHeight  float64
 	mu         sync.Mutex
 	currentB64 string
+	dstBuf     *image.RGBA
+	jpegBuf    bytes.Buffer
 }
 
 func NewCameraStreamer(hub *Hub, imagePath string, width, height float64) *CameraStreamer {
@@ -74,8 +76,8 @@ func (c *CameraStreamer) processAndBroadcast() {
 		return
 	}
 
-	img = shrinkImage(img, c.outWidth, c.outHeight)
-	b64 := imageToBase64(img)
+	shrunk := c.shrinkImage(img)
+	b64 := c.imageToBase64(shrunk)
 	if b64 == "" {
 		log.Printf("camera: encode image to base64 failed")
 		return
@@ -108,13 +110,13 @@ func (c *CameraStreamer) GetCurrentFrame() string {
 	return c.currentB64
 }
 
-func shrinkImage(img image.Image, maxW, maxH float64) image.Image {
+func (c *CameraStreamer) shrinkImage(img image.Image) image.Image {
 	bounds := img.Bounds()
 	w := float64(bounds.Dx())
 	h := float64(bounds.Dy())
 
-	scaleX := maxW / w
-	scaleY := maxH / h
+	scaleX := c.outWidth / w
+	scaleY := c.outHeight / h
 	scale := scaleX
 	if scaleY < scale {
 		scale = scaleY
@@ -126,15 +128,17 @@ func shrinkImage(img image.Image, maxW, maxH float64) image.Image {
 
 	newW := int(w * scale)
 	newH := int(h * scale)
-	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
-	return dst
+	if c.dstBuf == nil || c.dstBuf.Bounds().Dx() != newW || c.dstBuf.Bounds().Dy() != newH {
+		c.dstBuf = image.NewRGBA(image.Rect(0, 0, newW, newH))
+	}
+	draw.ApproxBiLinear.Scale(c.dstBuf, c.dstBuf.Bounds(), img, img.Bounds(), draw.Over, nil)
+	return c.dstBuf
 }
 
-func imageToBase64(img image.Image) string {
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, nil); err != nil {
+func (c *CameraStreamer) imageToBase64(img image.Image) string {
+	c.jpegBuf.Reset()
+	if err := jpeg.Encode(&c.jpegBuf, img, nil); err != nil {
 		return ""
 	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes())
+	return base64.StdEncoding.EncodeToString(c.jpegBuf.Bytes())
 }

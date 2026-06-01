@@ -9,9 +9,9 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -211,13 +211,7 @@ func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunOutput(w http.ResponseWriter, r *http.Request) {
-	data, err := os.ReadFile(s.cfg.OutputFilePath)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write(data)
+	http.ServeFile(w, r, s.cfg.OutputFilePath)
 }
 
 func (s *Server) handleRunTimeLeft(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +270,7 @@ func (s *Server) handleEditorRead(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEditorWrite(w http.ResponseWriter, r *http.Request) {
 	filename := r.PathValue("filename")
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -311,7 +306,10 @@ func (s *Server) handleWSCamera(w http.ResponseWriter, r *http.Request) {
 		conn.WriteMessage(websocket.TextMessage, []byte("[CAMERA]"+frame))
 	}
 
-	s.wsHub.Add(conn)
+	if err := s.wsHub.Add(conn); err != nil {
+		conn.Close()
+		return
+	}
 	defer s.wsHub.Remove(conn)
 
 	for {
@@ -329,7 +327,10 @@ func (s *Server) handleWSLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.wsHub.Add(conn)
+	if err := s.wsHub.Add(conn); err != nil {
+		conn.Close()
+		return
+	}
 	defer s.wsHub.Remove(conn)
 
 	for {
@@ -350,6 +351,8 @@ func (s *Server) handleWSPyls(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Static file handler ---
+
+var staticCache sync.Map
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -378,12 +381,17 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path = strings.TrimPrefix(path, "/")
 
 	if s.staticFS != nil {
-		data, err := fs.ReadFile(s.staticFS, path)
-		if err != nil {
-			http.NotFound(w, r)
-			return
+		dataI, ok := staticCache.Load(path)
+		if !ok {
+			data, err := fs.ReadFile(s.staticFS, path)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			staticCache.Store(path, data)
+			dataI = data
 		}
-		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(data))
+		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(dataI.([]byte)))
 		return
 	}
 

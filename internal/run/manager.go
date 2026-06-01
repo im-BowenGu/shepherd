@@ -10,6 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/RoboConOxfordshire/shepherd/internal/hardware"
 )
 
 type Manager struct {
@@ -233,10 +235,13 @@ func (m *Manager) Reset() {
 
 	m.createFIFO()
 
-	cmd := exec.Command("python3", "-c", "import robot.reset; robot.reset.reset()")
-	cmd.Env = append(os.Environ(), "PYTHONPATH="+m.cfg.RobotLibPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("robot.reset failed: %v\n%s", err, out)
+	if err := hardware.Reset(1); err != nil {
+		log.Printf("Go hardware reset failed, falling back to Python: %v", err)
+		cmd := exec.Command("python3", "-c", "import robot.reset; robot.reset.reset()")
+		cmd.Env = append(os.Environ(), "PYTHONPATH="+m.cfg.RobotLibPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("robot.reset (Python fallback) also failed: %v\n%s", err, out)
+		}
 	}
 }
 

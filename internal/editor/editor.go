@@ -62,6 +62,9 @@ func (h *Handler) ListFiles() (*ProjectList, error) {
 		if !isProjectFile(name) {
 			continue
 		}
+		if len(result.Projects) >= 100 {
+			break
+		}
 
 		data, err := os.ReadFile(filepath.Join(h.robotsrcPath, name))
 		if err != nil {

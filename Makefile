@@ -5,7 +5,7 @@ GOOS?=linux
 GOARCH?=arm64
 
 build:
-	go build -o $(BINARY) ./cmd/shepherd
+	go build -o $(BINARY) -trimpath -ldflags="-s -w" ./cmd/shepherd
 
 run: build
 	./$(BINARY)

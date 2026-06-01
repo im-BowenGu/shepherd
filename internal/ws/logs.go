@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -9,10 +10,11 @@ import (
 )
 
 type LogStreamer struct {
-	hub     *Hub
+	hub    *Hub
 	logPath string
-	mu      sync.Mutex
-	oldLogs string
+	mu     sync.Mutex
+	f      *os.File
+	offset int64
 }
 
 func NewLogStreamer(hub *Hub, logPath string) *LogStreamer {
@@ -23,21 +25,24 @@ func NewLogStreamer(hub *Hub, logPath string) *LogStreamer {
 }
 
 func (l *LogStreamer) Start() error {
+	var err error
+	l.f, err = os.Open(l.logPath)
+	if err != nil {
+		return err
+	}
+
+	l.offset, _ = l.f.Seek(0, io.SeekEnd)
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
+		l.f.Close()
 		return err
 	}
 
 	if err := watcher.Add(l.logPath); err != nil {
 		watcher.Close()
+		l.f.Close()
 		return err
-	}
-
-	initial, err := os.ReadFile(l.logPath)
-	if err == nil {
-		l.mu.Lock()
-		l.oldLogs = string(initial)
-		l.mu.Unlock()
 	}
 
 	go func() {
@@ -65,24 +70,17 @@ func (l *LogStreamer) Start() error {
 }
 
 func (l *LogStreamer) processAndBroadcast() {
-	data, err := os.ReadFile(l.logPath)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	newData, err := io.ReadAll(l.f)
 	if err != nil {
-		log.Printf("logs: read file: %v", err)
+		log.Printf("logs: read: %v", err)
 		return
 	}
+	l.offset += int64(len(newData))
 
-	l.mu.Lock()
-	oldLogs := l.oldLogs
-	newLogs := string(data)
-	idx := len(newLogs) - len(oldLogs)
-	if idx < 0 {
-		idx = 0
-	}
-	diff := newLogs[idx:]
-	l.oldLogs = newLogs
-	l.mu.Unlock()
-
-	if diff != "" {
-		l.hub.Broadcast([]byte("[LOGS]" + diff))
+	if len(newData) > 0 {
+		l.hub.Broadcast([]byte("[LOGS]" + string(newData)))
 	}
 }
