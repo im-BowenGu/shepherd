@@ -29,9 +29,9 @@ const (
 
 // Pin count constants.
 const (
-	NumPins     = 4
-	NumMotors   = 2
-	ServoCount  = 4
+	NumPins    = 4
+	NumMotors  = 2
+	ServoCount = 4
 )
 
 // Pin modes (written to control register).
@@ -46,9 +46,9 @@ const (
 
 // Default PWM centres and ranges.
 const (
-	GGPwmCenter     = 374
-	GGPwmHalfRange  = 224
-	PiLowPwmCenter  = 4500
+	GGPwmCenter       = 374
+	GGPwmHalfRange    = 224
+	PiLowPwmCenter    = 4500
 	PiLowPwmHalfRange = 2100
 )
 
@@ -60,8 +60,8 @@ type Board struct {
 
 // Pin represents a single GPIO/PWM/Servo pin.
 type Pin struct {
-	board   *Board
-	index   int // 0-3
+	board *Board
+	index int // 0-3
 }
 
 // Motor represents a single motor channel.
@@ -96,6 +96,18 @@ func (b *Board) Close() error {
 	return b.dev.Close()
 }
 
+// BoardPresent reports whether a board answers at the GreenGiant address on
+// the given bus. Callers use this to avoid expensive fallbacks that cannot
+// possibly succeed because nothing is on the bus.
+func BoardPresent(bus int) bool {
+	b, err := Open(bus)
+	if err != nil {
+		return false
+	}
+	b.Close()
+	return true
+}
+
 // Version returns the board firmware version (<10 = GreenGiant, >=10 = PiLow).
 func (b *Board) Version() int { return b.version }
 
@@ -104,8 +116,8 @@ func (b *Board) IsPiLow() bool { return b.version >= 10 }
 
 // --- Power Management ---
 
-func (b *Board) readReg(reg byte) (byte, error)  { return b.dev.readByte(reg) }
-func (b *Board) writeReg(reg, val byte) error { return b.dev.writeByte(reg, val) }
+func (b *Board) readReg(reg byte) (byte, error) { return b.dev.readByte(reg) }
+func (b *Board) writeReg(reg, val byte) error   { return b.dev.writeByte(reg, val) }
 
 func (b *Board) GetBatteryVoltage() (float64, error) {
 	raw, err := b.dev.readWord(RegBatteryVH)
@@ -220,10 +232,10 @@ func (b *Board) Pin(index int) *Pin {
 	return &Pin{board: b, index: index}
 }
 
-func (p *Pin) controlReg() byte  { return RegControlStart + byte(p.index) }
-func (p *Pin) digitalReg() byte  { return RegDigitalStart + byte(p.index) }
-func (p *Pin) analogHReg() byte  { return RegAnalogStart + byte(p.index)*2 }
-func (p *Pin) pwmHReg() byte     { return RegServoPWMBase + byte(p.index)*2 }
+func (p *Pin) controlReg() byte { return RegControlStart + byte(p.index) }
+func (p *Pin) digitalReg() byte { return RegDigitalStart + byte(p.index) }
+func (p *Pin) analogHReg() byte { return RegAnalogStart + byte(p.index)*2 }
+func (p *Pin) pwmHReg() byte    { return RegServoPWMBase + byte(p.index)*2 }
 
 func (p *Pin) IsPiLow() bool { return p.board.IsPiLow() }
 
@@ -275,8 +287,8 @@ func (b *Board) Motor(index int) *Motor {
 	return &Motor{board: b, index: index}
 }
 
-func (m *Motor) magReg() byte  { return RegMotorMagStart + byte(m.index)*2 }
-func (m *Motor) dirReg() byte  { return RegMotorDirStart + byte(m.index) }
+func (m *Motor) magReg() byte { return RegMotorMagStart + byte(m.index)*2 }
+func (m *Motor) dirReg() byte { return RegMotorDirStart + byte(m.index) }
 
 // SetPower sets motor power (-100 to 100). Negative = reverse.
 func (m *Motor) SetPower(pct int) error {

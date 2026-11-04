@@ -10,11 +10,11 @@ import (
 )
 
 type LogStreamer struct {
-	hub    *Hub
+	hub     *Hub
 	logPath string
-	mu     sync.Mutex
-	f      *os.File
-	offset int64
+	mu      sync.Mutex
+	f       *os.File
+	offset  int64
 }
 
 func NewLogStreamer(hub *Hub, logPath string) *LogStreamer {

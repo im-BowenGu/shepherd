@@ -25,9 +25,9 @@ type BlocksConfig struct {
 }
 
 type ProjectList struct {
-	Main     string          `json:"main"`
-	Blocks   BlocksConfig    `json:"blocks"`
-	Projects []FileEntry     `json:"projects"`
+	Main     string       `json:"main"`
+	Blocks   BlocksConfig `json:"blocks"`
+	Projects []FileEntry  `json:"projects"`
 }
 
 func NewHandler(robotsrcPath string) *Handler {

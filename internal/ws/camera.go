@@ -7,6 +7,7 @@ import (
 	"image/jpeg"
 	"log"
 	"os"
+	"time"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
@@ -70,7 +71,15 @@ func (c *CameraStreamer) Start() error {
 }
 
 func (c *CameraStreamer) processAndBroadcast() {
-	img, err := c.readImage()
+	var img image.Image
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		img, err = c.readImage()
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
 		log.Printf("camera: read image: %v", err)
 		return

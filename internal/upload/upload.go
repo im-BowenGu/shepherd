@@ -42,8 +42,20 @@ func (h *UploadHandler) ProcessUpload(file multipart.File, header *multipart.Fil
 	return fmt.Errorf("unsupported file type: %s", filename)
 }
 
+func (h *UploadHandler) stagingTempDir() (string, error) {
+	// Stage next to the usercode dir: os.Rename() cannot move a directory
+	// across devices, and /tmp is a separate tmpfs from the rootfs on the
+	// brain. Creating the staging dir as a sibling of userCodePath keeps the
+	// final rename an atomic same-filesystem move.
+	parent := filepath.Dir(h.userCodePath)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return "", fmt.Errorf("create staging parent: %w", err)
+	}
+	return os.MkdirTemp(parent, ".shepherd-user-code-")
+}
+
 func (h *UploadHandler) processPythonFile(file multipart.File) error {
-	tempDir, err := os.MkdirTemp("", "shepherd-user-code-")
+	tempDir, err := h.stagingTempDir()
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
@@ -70,7 +82,7 @@ func (h *UploadHandler) processZipFile(file multipart.File, size int64) error {
 		return fmt.Errorf("zip file too large (max %d bytes)", maxExtractionSize)
 	}
 
-	tempDir, err := os.MkdirTemp("", "shepherd-user-code-")
+	tempDir, err := h.stagingTempDir()
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}

@@ -11,21 +11,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RoboConOxfordshire/shepherd/internal/game"
 	"github.com/RoboConOxfordshire/shepherd/internal/hardware"
 )
 
 type Manager struct {
 	mu sync.Mutex
 
-	cfg    Config
-	state  State
-	zone   string
-	mode   Mode
-	cmd    *exec.Cmd
+	cfg     Config
+	state   State
+	zone    string
+	arena   string
+	mode    Mode
+	cmd     *exec.Cmd
 	cmdWait chan error
 
 	reaperTimer *time.Timer
 	reapTime    time.Time
+	startTime   time.Time
 	fifoDir     string
 	fifoPath    string
 	outputFile  *os.File
@@ -38,9 +41,16 @@ type Config struct {
 	OutputFilePath     string
 	RoundLength        time.Duration
 	ReapGracePeriod    time.Duration
+	Game               game.Config
 }
 
 func NewManager(cfg Config) (*Manager, error) {
+	if cfg.Game.Name == "" {
+		cfg.Game = game.DefaultConfig()
+	}
+	if cfg.RoundLength <= 0 {
+		cfg.RoundLength = cfg.Game.RoundLength()
+	}
 	m := &Manager{
 		cfg:   cfg,
 		state: StateReady,
@@ -128,17 +138,29 @@ func (m *Manager) waitForExit(cmd *exec.Cmd, cmdWait chan<- error) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) SendStartSignal(zone string, mode Mode) error {
+func (m *Manager) SendStartSignal(zone, arena string, mode Mode) error {
 	m.mu.Lock()
 	m.zone = zone
+	m.arena = arena
 	m.mode = mode
 	m.state = StateRunning
 	m.mu.Unlock()
 
+	team := m.cfg.Game.TeamForZone(zone)
 	data := map[string]any{
-		"mode":  string(mode),
-		"zone":  zone,
-		"arena": "A",
+		"mode":       string(mode),
+		"zone":       zone,
+		"team":       string(team),
+		"team_index": team.Index(),
+		"arena":      arena,
+		"colour":     string(team),
+		// The robot library can use these to know when the Snitch window is,
+		// without having to poll shepherd or guess the round length.
+		"round_length_seconds": m.cfg.RoundLength.Seconds(),
+		"snitch_window_opens_after_seconds": m.cfg.RoundLength.Seconds() -
+			float64(m.cfg.Game.SnitchDropEarliestSeconds),
+		"snitch_window_closes_after_seconds": m.cfg.RoundLength.Seconds() -
+			float64(m.cfg.Game.SnitchDropLatestSeconds),
 	}
 
 	raw, err := json.Marshal(data)
@@ -146,14 +168,42 @@ func (m *Manager) SendStartSignal(zone string, mode Mode) error {
 		return fmt.Errorf("marshal start data: %w", err)
 	}
 
-	return os.WriteFile(m.fifoPath, raw, 0644)
+	// Open the fifo non-blocking: a plain WriteFile on a fifo with no reader
+	// (e.g. user code that never calls wait_start) would block forever and
+	// hang the /run/start request. If there is no reader yet, the code either
+	// already exited or never waits - record the start and carry on.
+	fd, err := syscall.Open(m.fifoPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if err == syscall.ENXIO {
+			log.Printf("start signal: no fifo reader (user code not waiting), zone=%s arena=%s", zone, arena)
+			return nil
+		}
+		return fmt.Errorf("open start fifo: %w", err)
+	}
+	defer syscall.Close(fd)
+	if _, err := syscall.Write(fd, raw); err != nil {
+		if err == syscall.EAGAIN || err == syscall.ENXIO {
+			log.Printf("start signal: unable to deliver (no reader), zone=%s arena=%s", zone, arena)
+			return nil
+		}
+		return fmt.Errorf("write start fifo: %w", err)
+	}
+	return nil
+}
+
+// colourForZone maps the 1-based zone file on the arena USB to the team colour
+// for the 2027 Quidditch game. Zone 0 is the historical "no zone" fallback and
+// is treated as the red team.
+func colourForZone(zone string) string {
+	return string(game.TeamForZone(zone))
 }
 
 func (m *Manager) StartReaper() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.reapTime = time.Now().Add(m.cfg.RoundLength)
+	m.startTime = time.Now()
+	m.reapTime = m.startTime.Add(m.cfg.RoundLength)
 	m.reaperTimer = time.AfterFunc(m.cfg.RoundLength, func() {
 		m.Reap("end of round")
 	})
@@ -219,7 +269,10 @@ func (m *Manager) Reset() {
 	m.mu.Lock()
 	m.state = StateReady
 	m.zone = ""
+	m.arena = ""
 	m.mode = ""
+	m.startTime = time.Time{}
+	m.reapTime = time.Time{}
 
 	if m.outputFile != nil {
 		m.outputFile.Close()
@@ -236,11 +289,18 @@ func (m *Manager) Reset() {
 	m.createFIFO()
 
 	if err := hardware.Reset(1); err != nil {
-		log.Printf("Go hardware reset failed, falling back to Python: %v", err)
-		cmd := exec.Command("python3", "-c", "import robot.reset; robot.reset.reset()")
-		cmd.Env = append(os.Environ(), "PYTHONPATH="+m.cfg.RobotLibPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("robot.reset (Python fallback) also failed: %v\n%s", err, out)
+		if !hardware.BoardPresent(1) {
+			// Nothing on the bus: the Python fallback would fail the same way,
+			// but only after a cold cv2/libLLVM import (seconds) on the upload
+			// path, where every millisecond is felt.
+			log.Printf("Skipping hardware reset, no board on I2C bus 1: %v", err)
+		} else {
+			log.Printf("Go hardware reset failed, falling back to Python: %v", err)
+			cmd := exec.Command("python3", "-c", "import robot.reset; robot.reset.reset()")
+			cmd.Env = append(os.Environ(), "PYTHONPATH="+m.cfg.RobotLibPath)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("robot.reset (Python fallback) also failed: %v\n%s", err, out)
+			}
 		}
 	}
 }
@@ -269,10 +329,36 @@ func (m *Manager) TimeLeft() *time.Duration {
 	return &left
 }
 
+// Timing returns the round clock and Snitch-window state for the current
+// round.  It returns nil before a competition round has started.
+func (m *Manager) Timing() *game.Timing {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.startTime.IsZero() {
+		return nil
+	}
+	timing := m.cfg.Game.TimingAt(time.Since(m.startTime))
+	return &timing
+}
+
+// Team returns the team for the current round.
+func (m *Manager) Team() game.Team {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.Game.TeamForZone(m.zone)
+}
+
 func (m *Manager) Zone() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.zone
+}
+
+func (m *Manager) Arena() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.arena
 }
 
 func (m *Manager) Mode() Mode {
