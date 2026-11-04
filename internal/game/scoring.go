@@ -79,8 +79,8 @@ func ScoreTeam(round TeamRound) TeamScore {
 
 	score.QuafflePoints = score.QuaffleBase
 	if round.Snitch {
-		// The Snitch multiplies all points accrued from Quaffles by ten.
-		score.SnitchMultiplier = 10
+		// The Snitch multiplies all points accrued from Quaffles by three.
+		score.SnitchMultiplier = 3
 		score.QuafflePoints *= score.SnitchMultiplier
 	}
 	if round.MajorityInBludger && score.QuafflePoints > 0 {

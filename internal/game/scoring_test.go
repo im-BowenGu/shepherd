@@ -47,11 +47,11 @@ func TestScoreTeam(t *testing.T) {
 	if score.QuaffleBase != 6 {
 		t.Errorf("QuaffleBase = %d, want 6", score.QuaffleBase)
 	}
-	if score.SnitchMultiplier != 10 || score.QuafflePoints != 60 {
-		t.Errorf("snitch scoring = %+v, want multiplier 10 and 60 points", score)
+	if score.SnitchMultiplier != 3 || score.QuafflePoints != 18 {
+		t.Errorf("snitch scoring = %+v, want multiplier 3 and 18 points", score)
 	}
-	if score.Total != 62 {
-		t.Errorf("Total = %d, want 62", score.Total)
+	if score.Total != 20 {
+		t.Errorf("Total = %d, want 20", score.Total)
 	}
 }
 
