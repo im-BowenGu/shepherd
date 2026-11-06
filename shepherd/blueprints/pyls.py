@@ -1,17 +1,15 @@
-"""Python Language Server used to implement autocompletion in sheep in the
-native enviroment on the robot
+"""Python Language Server used to implement autocompletion in the
+native environment on the robot.
 
-For more infomation see:
+For more information see:
 https://code.visualstudio.com/api/language-extensions/language-server-extension-guide
 
-Doc's of jsonrpc: https://json-rpc.readthedocs.io/en/latest/quickstart.html
-Doc's of pyls_jsonrpc: https://github.com/palantir/python-language-server
+JSON-RPC docs: https://json-rpc.readthedocs.io/en/latest/quickstart.html
+pyls_jsonrpc docs: https://github.com/palantir/python-language-server
 
-TODO check that this is getting autocomplete for the robot libarry
-
-FIXME/TODO
+Note: Autocomplete for robot library requires robot lib to be in PYTHONPATH.
 Crashes with the bellow upon the user closing the tab. This is expected behaviour
-but it would be nice to make the logs nicer
+but it would be nice to make the logs nicer:
 INFO:root:Exiting pyls with the JSON object must be str, bytes or bytearray, not
 'NoneType'
 """

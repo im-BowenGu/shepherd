@@ -112,7 +112,7 @@ func (s *Server) onUpload() {
 
 func (s *Server) onStartButton(zone, arena string) {
 	if s.runMgr.State() == run.StateReady {
-		s.runMgr.StartUserCode()
+		s.runMgr.EnsureUserCode()
 		s.runMgr.SendStartSignal(zone, arena, run.ModeCompetition)
 		s.runMgr.StartReaper()
 	}
@@ -201,7 +201,13 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Cleanup runs in its own goroutine, but Run must not return until it has
+	// finished killing the user-code child: main() returns as soon as Run
+	// does, and an orphaned user-code process keeps the libcamera pipeline
+	// held, so the next shepherd start fails to acquire the camera.
+	cleanupDone := make(chan struct{})
 	go func() {
+		defer close(cleanupDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -211,9 +217,12 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	log.Printf("Shepherd listening on :%d", s.cfg.Port)
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+	err := httpServer.ListenAndServe()
+	if err != http.ErrServerClosed {
+		<-cleanupDone
 		return err
 	}
+	<-cleanupDone
 	return nil
 }
 
@@ -317,7 +326,11 @@ func (s *Server) handleRunStart(w http.ResponseWriter, r *http.Request) {
 		mode = run.ModeCompetition
 	}
 
-	if err := s.runMgr.StartUserCode(); err != nil {
+	// The user-code process is launched at boot/upload and waits for the
+	// start signal. If it isn't running yet (e.g. it exited), start it now;
+	// otherwise just send the signal. Starting unconditionally would spawn a
+	// second process and collide on the camera.
+	if err := s.runMgr.EnsureUserCode(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -604,6 +617,17 @@ var staticCache sync.Map
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	// The editor web UI reads the live camera frame from /static/image.jpg.
+	// Serving the file committed into the embedded FS would show the same
+	// static (copyright-troll) image forever, so serve the real camera output
+	// from the filesystem, bypassing the embed and the caches.
+	if path == "/static/image.jpg" {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		http.ServeFile(w, r, s.cfg.CameraImagePath)
+		return
+	}
+
 	// Match the original shepherd: / redirects to the editor app so its
 	// relative bundle.js/style.css resolve against /editor/.
 	if path == "/" {
@@ -641,6 +665,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 			staticCache.Store(path, data)
 			dataI = data
 		}
+		// Always revalidate: a stale cached bundle.js once shipped the old
+		// camera MIME bug and a corrupted start image to browsers that never
+		// refetched.
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(dataI.([]byte)))
 		return
 	}

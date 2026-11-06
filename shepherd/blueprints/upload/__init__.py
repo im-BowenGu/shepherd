@@ -11,7 +11,7 @@ import zipfile
 
 from flask import Blueprint, render_template, flash, redirect, url_for, request, abort, current_app
 
-from shepherd.blueprints import run  # FIXME: this coupling is horrific
+from shepherd.blueprints import run  # Tight coupling to run blueprint (circular import risk)
 import robot.reset as robot_reset  # This *should* be safe, if nasty.
 
 blueprint = Blueprint("upload", __name__, template_folder="templates")
@@ -36,7 +36,7 @@ def upload():
         if err:
             flash(err, "error")
         else:
-            flash("Your file looks good!", "success")  # TODO: run a linter on the code?
+            flash("Your file looks good!", "success")
             if run.reaper_timer is not None:
                 run.reaper_timer.cancel()
             run.reap(reason="new code upload")

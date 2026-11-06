@@ -14,6 +14,16 @@ type Hub struct {
 	clients map[*websocket.Conn]struct{}
 }
 
+// HasClients reports whether any websocket client is connected. The camera
+// streamer uses this to skip the expensive JPEG decode/resize/encode cycle
+// when nobody is watching - on a Pi Zero 2 W that work competes with the
+// vision pipeline for the same four cores.
+func (h *Hub) HasClients() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.clients) > 0
+}
+
 func NewHub() *Hub {
 	return &Hub{
 		clients: make(map[*websocket.Conn]struct{}),

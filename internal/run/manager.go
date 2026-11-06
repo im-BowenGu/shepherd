@@ -26,6 +26,9 @@ type Manager struct {
 	cmd     *exec.Cmd
 	cmdWait chan error
 
+	// runSeq increments on every stop/reset so a pending async start-signal
+	// delivery can detect that the round it belonged to is gone.
+	runSeq      uint64
 	reaperTimer *time.Timer
 	reapTime    time.Time
 	startTime   time.Time
@@ -79,11 +82,12 @@ func (m *Manager) StartUserCode() error {
 		m.mu.Unlock()
 		return fmt.Errorf("code is already running")
 	}
+	// A previous child should have been reaped (cmdWait nil'd) before we get
+	// here. If one is still tracked, refuse: two live user-code processes
+	// would both try to acquire the camera.
 	if m.cmdWait != nil {
-		select {
-		case <-m.cmdWait:
-		default:
-		}
+		m.mu.Unlock()
+		return fmt.Errorf("previous user code is still running")
 	}
 	m.mu.Unlock()
 
@@ -105,6 +109,11 @@ func (m *Manager) StartUserCode() error {
 	cmd.Env = append(os.Environ(),
 		"PYTHONPATH="+m.cfg.RobotLibPath,
 	)
+	// Put the child in its own process group so a kill can take down the whole
+	// tree. If user code (or a library it pulls in) forks, killing only the
+	// direct child would orphan the grandchild, which keeps /dev/media* held
+	// and makes the next run fail to acquire the camera.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		f.Close()
@@ -143,7 +152,8 @@ func (m *Manager) SendStartSignal(zone, arena string, mode Mode) error {
 	m.zone = zone
 	m.arena = arena
 	m.mode = mode
-	m.state = StateRunning
+	m.runSeq++
+	seq := m.runSeq
 	m.mu.Unlock()
 
 	team := m.cfg.Game.TeamForZone(zone)
@@ -168,27 +178,61 @@ func (m *Manager) SendStartSignal(zone, arena string, mode Mode) error {
 		return fmt.Errorf("marshal start data: %w", err)
 	}
 
-	// Open the fifo non-blocking: a plain WriteFile on a fifo with no reader
-	// (e.g. user code that never calls wait_start) would block forever and
-	// hang the /run/start request. If there is no reader yet, the code either
-	// already exited or never waits - record the start and carry on.
-	fd, err := syscall.Open(m.fifoPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		if err == syscall.ENXIO {
-			log.Printf("start signal: no fifo reader (user code not waiting), zone=%s arena=%s", zone, arena)
-			return nil
-		}
-		return fmt.Errorf("open start fifo: %w", err)
-	}
-	defer syscall.Close(fd)
-	if _, err := syscall.Write(fd, raw); err != nil {
-		if err == syscall.EAGAIN || err == syscall.ENXIO {
-			log.Printf("start signal: unable to deliver (no reader), zone=%s arena=%s", zone, arena)
-			return nil
-		}
-		return fmt.Errorf("write start fifo: %w", err)
-	}
+	// The start signal is delivered asynchronously with retries. User code can
+	// take several seconds to reach its blocking open() of the start fifo
+	// (importing cv2, libcamera init), and a single non-blocking open at that
+	// moment would drop the signal silently - the round then shows as running
+	// while user code blocks in wait_start() forever. Retry until the reader
+	// appears, so a Start press always takes effect.
+	go m.deliverStartSignal(raw, seq, zone, arena)
 	return nil
+}
+
+// deliverStartSignal writes the start payload to the fifo, retrying until the
+// user-code process opens its end. Aborts if the run was superseded (stop or
+// reset bumped runSeq) so a stale signal can never start freshly uploaded
+// code. Marks the round running only once the signal is actually delivered,
+// so /run/status reflects real code-start rather than the button press.
+func (m *Manager) deliverStartSignal(raw []byte, seq uint64, zone, arena string) {
+	defer func() {
+		m.mu.Lock()
+		if m.runSeq == seq {
+			m.state = StateRunning
+			log.Printf("start signal: round running (zone=%s arena=%s)", zone, arena)
+		}
+		m.mu.Unlock()
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		m.mu.Lock()
+		stale := m.runSeq != seq
+		m.mu.Unlock()
+		if stale {
+			log.Printf("start signal: aborted, round superseded (zone=%s arena=%s)", zone, arena)
+			return
+		}
+		fd, err := syscall.Open(m.fifoPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			n, werr := syscall.Write(fd, raw)
+			syscall.Close(fd)
+			if werr == nil && n == len(raw) {
+				log.Printf("start signal: delivered (zone=%s arena=%s)", zone, arena)
+				return
+			}
+			if werr != nil && werr != syscall.EAGAIN {
+				log.Printf("start signal: write fifo: %v", werr)
+				return
+			}
+		} else if err != syscall.ENXIO {
+			log.Printf("start signal: open fifo: %v", err)
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("start signal: no fifo reader within 30s (user code never waited), zone=%s arena=%s", zone, arena)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // colourForZone maps the 1-based zone file on the arena USB to the team colour
@@ -222,11 +266,11 @@ func (m *Manager) StopReaper() {
 func (m *Manager) Reap(reason string) {
 	m.mu.Lock()
 	log.Printf("Reaping user code (%s)", reason)
-	if m.state != StateRunning {
-		log.Printf("Warning: state is %s, not running", m.state)
-		m.mu.Unlock()
-		return
-	}
+	// Kill the child whenever one exists, regardless of run state. A child is
+	// live in both StateReady (loaded, waiting for the start button) and
+	// StateRunning (round in progress). Refusing to reap in StateReady leaves
+	// the process holding the libcamera pipeline, so the next upload/start
+	// collides with it ("Pipeline handler in use by another process").
 	if m.cmd == nil || m.cmd.Process == nil {
 		m.mu.Unlock()
 		return
@@ -234,18 +278,18 @@ func (m *Manager) Reap(reason string) {
 	cmdWait := m.cmdWait
 	m.mu.Unlock()
 
-	if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		log.Printf("SIGTERM failed: %v", err)
-	}
+	// Signal the whole process group (negative pid) so any children the user
+	// code spawned are killed too, not just the direct python3 process.
+	signalGroup(m.cmd.Process.Pid, syscall.SIGTERM)
 
-	select {
-	case <-cmdWait:
-	case <-time.After(m.cfg.ReapGracePeriod):
-		log.Println("Butchering user code")
-		if err := m.cmd.Process.Signal(syscall.SIGKILL); err != nil {
-			log.Printf("SIGKILL failed: %v", err)
+	if cmdWait != nil {
+		select {
+		case <-cmdWait:
+		case <-time.After(m.cfg.ReapGracePeriod):
+			log.Println("Butchering user code")
+			signalGroup(m.cmd.Process.Pid, syscall.SIGKILL)
+			<-cmdWait
 		}
-		<-cmdWait
 	}
 
 	m.mu.Lock()
@@ -254,6 +298,15 @@ func (m *Manager) Reap(reason string) {
 		m.outputFile.Close()
 		m.outputFile = nil
 	}
+	// The child is dead: drop the handles so a later Reap()/StartUserCode()
+	// isn't fooled into thinking one is still alive.
+	// Give libcamera a moment to release the camera device after the child
+	// dies; a new round starting immediately otherwise finds the pipeline
+	// still held by the dying process and crashes with "Pipeline handler in
+	// use by another process".
+	time.Sleep(300 * time.Millisecond)
+	m.cmd = nil
+	m.cmdWait = nil
 	m.state = StatePostRun
 	m.mu.Unlock()
 
@@ -265,6 +318,28 @@ func (m *Manager) Stop() {
 	m.Reap("manual stop")
 }
 
+// signalGroup sends sig to the process group led by pid. Falls back to a
+// direct signal if the group send fails (e.g. the child already exited).
+func signalGroup(pid int, sig syscall.Signal) {
+	if err := syscall.Kill(-pid, sig); err != nil {
+		syscall.Kill(pid, sig)
+	}
+}
+
+// EnsureUserCode starts the user-code process only if one isn't already
+// running. The process is normally launched at boot and idles waiting for the
+// start signal, so a run start must not spawn a second copy (which would fight
+// over the libcamera pipeline).
+func (m *Manager) EnsureUserCode() error {
+	m.mu.Lock()
+	live := m.cmd != nil && m.cmdWait != nil
+	m.mu.Unlock()
+	if live {
+		return nil
+	}
+	return m.StartUserCode()
+}
+
 func (m *Manager) Reset() {
 	m.mu.Lock()
 	m.state = StateReady
@@ -273,6 +348,7 @@ func (m *Manager) Reset() {
 	m.mode = ""
 	m.startTime = time.Time{}
 	m.reapTime = time.Time{}
+	m.runSeq++ // invalidate any in-flight async start-signal delivery
 
 	if m.outputFile != nil {
 		m.outputFile.Close()
@@ -284,6 +360,11 @@ func (m *Manager) Reset() {
 		m.fifoDir = ""
 		m.fifoPath = ""
 	}
+	// Clear the handle to the previous child. Stop()/Reap() has already killed
+	// and waited on it; keeping the stale cmd/cmdWait around makes the next
+	// Reap() signal a dead process and blocks StartUserCode() forever.
+	m.cmd = nil
+	m.cmdWait = nil
 	m.mu.Unlock()
 
 	m.createFIFO()
@@ -375,6 +456,7 @@ func (m *Manager) Cleanup() {
 		m.reaperTimer.Stop()
 	}
 	if m.cmd != nil && m.cmd.Process != nil {
+		signalGroup(m.cmd.Process.Pid, syscall.SIGKILL)
 		m.cmd.Process.Kill()
 	}
 	if m.cmdWait != nil {

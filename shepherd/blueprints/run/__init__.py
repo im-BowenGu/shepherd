@@ -67,8 +67,8 @@ def _reset_state():
 def _user_code_wait():
     global user_code
     exit_code = user_code.wait()
-    # TODO: instead of checking for error code 1, check if the code isn't an expected code from SIGTERM or SIGKILL
-    if exit_code == 1:
+    # Check if the code exited with an error (not SIGTERM/SIGKILL which are expected)
+    if exit_code != 0 and exit_code not in (143, 137):
         round_end()
 
 def _start_user_code(app):
@@ -113,8 +113,8 @@ class Mode(Enum):  # Names are important -- they let us get a Mode from the subm
 @blueprint.before_app_first_request
 @blueprint.route("/reset", methods=["POST"])
 def reset():
-    # TODO
-    return "This is no longer functional."
+    # Deprecated: this endpoint is no longer functional.
+    return "This is no longer functional.", 410
 
 
 def time_left():
@@ -180,17 +180,19 @@ def start():
             flash("Your code seems to have crashed, not starting it.", "error")
         else:
             print("opening fifo")
-            # FIXME: should be in own thread so that if the code just takes a long time to load shepherd still functions
-            with open(USER_FIFO_PATH, "w") as f:
-                print("dumping json")
-                json.dump(
-                    {
-                        "mode": mode.value,
-                        "zone": int(zone),
-                        "arena": "A",
-                    }, f
-                )
-                print("json dumped")
+            # Write FIFO in thread to avoid blocking shepherd on slow reads
+            def write_fifo():
+                with open(USER_FIFO_PATH, "w") as f:
+                    print("dumping json")
+                    json.dump(
+                        {
+                            "mode": mode.value,
+                            "zone": int(zone),
+                            "arena": "A",
+                        }, f
+                    )
+                    print("json dumped")
+            threading.Thread(target=write_fifo, daemon=True).start()
             if mode == Mode.competition:
                 reaper_timer = threading.Timer(ROUND_LENGTH, round_end)
                 # If we get told to exit, there's no point waiting around for the round to finish.
