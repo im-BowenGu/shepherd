@@ -26,6 +26,7 @@ package hardware
 import (
 	"errors"
 	"log"
+	"os/exec"
 	"sync"
 	"syscall"
 	"time"
@@ -46,6 +47,11 @@ const (
 	// falling back to the normal interval.
 	keepaliveRetries    = 4
 	keepaliveRetryDelay = 500 * time.Millisecond
+	// When the board stops answering on I2C for this many consecutive
+	// keepalive ticks, the MCU is cutting the power rails. Shut the OS
+	// down gracefully first so the filesystem is synced before power is
+	// lost (3 × 5s ≈ 15s of warning).
+	keepaliveShutdownThreshold = 3
 )
 
 var (
@@ -179,6 +185,16 @@ func keepalive() {
 		boardInfo.LastError = err.Error()
 		boardInfo.Unlock()
 		log.Printf("board keepalive: no answer on I2C bus %d (%d in a row): %v", boardBus, misses, err)
+
+		if misses >= keepaliveShutdownThreshold {
+			log.Printf("board keepalive: MCU is cutting power - running shutdown -f")
+			if cmd := exec.Command("shutdown", "-f"); cmd != nil {
+				if err := cmd.Run(); err != nil {
+					log.Printf("board keepalive: shutdown -f failed: %v", err)
+				}
+			}
+			return
+		}
 
 		// The MCU may have dropped the rails; re-assert the level shifter and
 		// retry promptly rather than waiting a whole interval, because the MCU

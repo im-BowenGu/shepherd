@@ -268,6 +268,7 @@ func (s *Server) setupRoutes() {
 	mux.HandleFunc("DELETE /files/delete/{filename}", s.handleEditorDelete)
 	mux.HandleFunc("GET /upload/upload", s.handleUploadIndex)
 	mux.HandleFunc("POST /upload/upload", s.handleUploadFile)
+	mux.HandleFunc("GET /run/status", s.handleRunStatus)
 	mux.HandleFunc("GET /run/output", s.handleRunOutput)
 	mux.HandleFunc("POST /run/start", s.handleRunStart)
 	mux.HandleFunc("POST /run/stop", s.handleRunStop)
