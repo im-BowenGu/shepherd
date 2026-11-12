@@ -6,7 +6,7 @@ import (
 	"log"
 )
 
-//go:embed web/editor web/static web/docs
+//go:embed web/editor web/static
 var webFS embed.FS
 
 var staticFS fs.FS

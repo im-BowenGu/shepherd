@@ -83,7 +83,10 @@ func thumbnail(src, dst string, width, height int) error {
 	}
 
 	out := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.CatmullRom.Scale(out, out.Bounds(), img, img.Bounds(), draw.Over, nil)
+	// ApproxBiLinear rather than CatmullRom: this is a 1280x720 thumbnail of
+	// a 2240x2240 logo, and the high-quality resampler costs seconds of CPU
+	// on a Pi Zero 2 W for a difference nobody can see at that size.
+	draw.ApproxBiLinear.Scale(out, out.Bounds(), img, img.Bounds(), draw.Over, nil)
 
 	of, err := os.Create(dst)
 	if err != nil {

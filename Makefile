@@ -1,4 +1,4 @@
-.PHONY: build run fmt lint test clean
+.PHONY: build run fmt lint test clean cross
 
 BINARY=shepherd
 GOOS?=linux
@@ -36,6 +36,6 @@ clean:
 cross: $(BINARY)
 
 $(BINARY):
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BINARY) ./cmd/shepherd
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BINARY) -trimpath -ldflags="$(LDFLAGS)" ./cmd/shepherd
 
 .DEFAULT_GOAL := build

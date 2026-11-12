@@ -79,8 +79,9 @@ func rootDisk() string {
 		return "unknown"
 	}
 	used := (st.Blocks - st.Bfree) * uint64(st.Bsize)
+	total := st.Blocks * uint64(st.Bsize)
 	return fmt.Sprintf("%.1f%% used (%s free)",
-		float64(used)/float64(st.Blocks)*100,
+		float64(used)/float64(total)*100,
 		humanBytes(uint64(st.Bavail)*uint64(st.Bsize)))
 }
 

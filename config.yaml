@@ -1,0 +1,28 @@
+# Shepherd configuration
+# This file is read at startup. Environment variables override these values.
+
+port: 80
+user_code_path: /opt/shepherd/usercode
+user_code_entrypoint: main.py
+robot_lib_path: /opt/robot
+output_file_path: /media/RobotUSB/logs.txt
+
+# Camera frame transport.
+#   shm  - POSIX shared memory (fastest; the robot writes the JPEG straight
+#          into the mapping and shepherd polls the sequence counter)
+#   file - the frame is read from camera_image_path (fallback)
+#   udp  - frames arrive as UDP datagrams (for comparison; lossy)
+camera_ipc: shm
+camera_shm_name: /shepherd_cam
+camera_udp_addr: 127.0.0.1:9001
+camera_image_path: /tmp/shepherd/image.jpg
+
+arena_usb_path: /media/ArenaUSB
+team_name_file_path: /root/teamname.txt
+game_logo_path: /root/game_logo.jpg
+round_length: 180s
+reap_grace_period: 5s
+start_button_pin: 26
+image_width: 800
+image_height: 600
+game_config_path: ""

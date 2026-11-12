@@ -1,18 +1,18 @@
 package server
 
 import (
-	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -87,7 +87,7 @@ func New(cfg *config.Config, staticFS fs.FS) (*Server, error) {
 	}
 	s.editorH = editor.NewHandler(filepath.Join("robotsrc"))
 	s.uploadH = upload.NewHandler(cfg.UserCodePath, cfg.UserCodeEntrypoint, s.onUpload)
-	s.camStream = ws.NewCameraStreamer(wsHub, cfg.CameraImagePath, cfg.ImageWidth, cfg.ImageHeight)
+	s.camStream = ws.NewCameraStreamer(wsHub, cfg.CameraImagePath)
 	s.logStream = ws.NewLogStreamer(wsHub, cfg.OutputFilePath)
 	s.pylsProxy = ws.NewPylsProxy(cfg.RobotLibPath)
 
@@ -133,6 +133,70 @@ func (s *Server) announce(text string) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	// Claim the listening ports *before* the slow start-up work. The browser
+	// should be able to reach the web UI within milliseconds of the service
+	// starting, not after the board handshake and the start-graphic
+	// thumbnail (several seconds on a Pi Zero 2 W).
+	httpServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
+		Handler: s.mux,
+	}
+	listener, err := net.Listen("tcp", httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", httpServer.Addr, err)
+	}
+	log.Printf("Shepherd listening on :%d", s.cfg.Port)
+
+	// The original web UI connects to a websocket feeder on :5001 for the
+	// camera and program-output streams ([CAMERA]/[LOGS] prefixed frames,
+	// mirroring the legacy helper.py daemon).
+	wsMux := http.NewServeMux()
+	wsMux.HandleFunc("/", s.handleWSCameraLogs)
+	wsServer := &http.Server{Addr: ":5001", Handler: wsMux}
+	wsListener, err := net.Listen("tcp", wsServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", wsServer.Addr, err)
+	}
+	log.Printf("Shepherd ws feeder listening on :5001")
+
+	// The rest of the start-up (board handshake, hardware report, start
+	// graphic, user code) runs in the background: it is slow, and none of
+	// it is needed for the web UI to come up.
+	go func() {
+		s.bringUp()
+	}()
+
+	serveErr := make(chan error, 2)
+	go func() { serveErr <- httpServer.Serve(listener) }()
+	go func() { serveErr <- wsServer.Serve(wsListener) }()
+
+	// Cleanup runs in its own goroutine, but Run must not return until it has
+	// finished killing the user-code child: main() returns as soon as Run
+	// does, and an orphaned user-code process keeps the libcamera pipeline
+	// held, so the next shepherd start fails to acquire the camera.
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpServer.Shutdown(shutdownCtx)
+		wsServer.Shutdown(shutdownCtx)
+		s.runMgr.Cleanup()
+	}()
+
+	err = <-serveErr
+	if err != http.ErrServerClosed {
+		<-cleanupDone
+		return err
+	}
+	<-cleanupDone
+	return nil
+}
+
+// bringUp does the slow parts of the start-up: bring the board up, print the
+// hardware report, pick the start graphic and start the user's code.
+func (s *Server) bringUp() {
 	// Bring the board up before anything else touches it: the level shifter
 	// gate (GPIO18) is what makes the PiLow answer on I2C at all, and the
 	// board's MCU drops the power rails if it never sees a brain.
@@ -179,51 +243,33 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
+	// Pick the camera transport. Shared memory is the fastest: the robot
+	// writes the JPEG straight into the mapping and we poll the sequence
+	// counter. The file is the fallback (works even without /dev/shm), and
+	// UDP is available for comparison.
+	switch s.cfg.CameraIPC {
+	case "udp":
+		if src, err := ws.NewUDPSource(s.cfg.CameraUDPAddr); err == nil {
+			s.camStream.SetPrimary(src)
+			log.Printf("camera: using UDP transport (%s)", s.cfg.CameraUDPAddr)
+		} else {
+			log.Printf("camera: UDP transport unavailable (%v), falling back to file", err)
+		}
+	case "file":
+		log.Printf("camera: using file transport (%s)", s.cfg.CameraImagePath)
+	default:
+		if src, err := ws.NewSHMSource(s.cfg.CameraSHMName); err == nil {
+			s.camStream.SetPrimary(src)
+			log.Printf("camera: using shared memory transport (%s)", s.cfg.CameraSHMName)
+		} else {
+			log.Printf("camera: shared memory unavailable (%v), falling back to file", err)
+		}
+	}
+
 	s.camStream.Start()
+	go s.camStream.Run()
 	s.logStream.Start()
 	s.gpioBtn.Start()
-
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
-		Handler: s.mux,
-	}
-
-	// The original web UI connects to a websocket feeder on :5001 for the
-	// camera and program-output streams ([CAMERA]/[LOGS] prefixed frames,
-	// mirroring the legacy helper.py daemon).
-	wsMux := http.NewServeMux()
-	wsMux.HandleFunc("/", s.handleWSCameraLogs)
-	wsServer := &http.Server{Addr: ":5001", Handler: wsMux}
-	go func() {
-		log.Printf("Shepherd ws feeder listening on :5001")
-		if err := wsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("ws feeder: %v", err)
-		}
-	}()
-
-	// Cleanup runs in its own goroutine, but Run must not return until it has
-	// finished killing the user-code child: main() returns as soon as Run
-	// does, and an orphaned user-code process keeps the libcamera pipeline
-	// held, so the next shepherd start fails to acquire the camera.
-	cleanupDone := make(chan struct{})
-	go func() {
-		defer close(cleanupDone)
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		httpServer.Shutdown(shutdownCtx)
-		wsServer.Shutdown(shutdownCtx)
-		s.runMgr.Cleanup()
-	}()
-
-	log.Printf("Shepherd listening on :%d", s.cfg.Port)
-	err := httpServer.ListenAndServe()
-	if err != http.ErrServerClosed {
-		<-cleanupDone
-		return err
-	}
-	<-cleanupDone
-	return nil
 }
 
 func (s *Server) setupRoutes() {
@@ -454,7 +500,38 @@ func (s *Server) handleRunTimeLeft(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunPicture(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, s.cfg.CameraImagePath)
+	s.serveCameraImage(w, r)
+}
+
+// serveCameraImage serves the current camera frame as raw JPEG.
+//
+// The file on disk is written by the robot's vision library. When that file
+// is missing or empty (vision not running yet) fall back to the last frame
+// the camera streamer saw, and finally to the embedded placeholder.
+func (s *Server) serveCameraImage(w http.ResponseWriter, r *http.Request) {
+	if info, err := os.Stat(s.cfg.CameraImagePath); err == nil && info.Size() > 0 {
+		http.ServeFile(w, r, s.cfg.CameraImagePath)
+		return
+	}
+
+	if frame := s.camStream.GetCurrentFrame(); frame != "" {
+		if raw, err := base64.StdEncoding.DecodeString(frame); err == nil && len(raw) > 0 {
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			w.Write(raw)
+			return
+		}
+	}
+
+	// Last resort: the placeholder committed into the embedded FS.
+	if s.staticFS != nil {
+		if data, err := fs.ReadFile(s.staticFS, "static/image.jpg"); err == nil {
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Write(data)
+			return
+		}
+	}
+	http.NotFound(w, r)
 }
 
 // --- Upload handlers ---
@@ -613,8 +690,6 @@ func (s *Server) handleWSPyls(w http.ResponseWriter, r *http.Request) {
 
 // --- Static file handler ---
 
-var staticCache sync.Map
-
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
@@ -625,7 +700,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if path == "/static/image.jpg" {
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
-		http.ServeFile(w, r, s.cfg.CameraImagePath)
+		s.serveCameraImage(w, r)
 		return
 	}
 
@@ -656,21 +731,34 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path = strings.TrimPrefix(path, "/")
 
 	if s.staticFS != nil {
-		dataI, ok := staticCache.Load(path)
+		// Serve straight out of the embedded filesystem. The web assets are
+		// ~20MB (the editor bundle alone is 3.6MB) and copying them into a
+		// cache kept a second full copy of everything the browser had
+		// fetched resident on a 352MB Pi. The embedded files are already
+		// mapped into the binary, so serving them directly costs nothing
+		// extra.
+		f, err := s.staticFS.Open(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		// ServeContent needs to seek; the embedded filesystem's files can.
+		rs, ok := f.(io.ReadSeeker)
 		if !ok {
-			data, err := fs.ReadFile(s.staticFS, path)
-			if err != nil {
-				http.NotFound(w, r)
-				return
-			}
-			staticCache.Store(path, data)
-			dataI = data
+			http.NotFound(w, r)
+			return
 		}
 		// Always revalidate: a stale cached bundle.js once shipped the old
 		// camera MIME bug and a corrupted start image to browsers that never
 		// refetched.
 		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(dataI.([]byte)))
+		http.ServeContent(w, r, path, info.ModTime(), rs)
 		return
 	}
 
